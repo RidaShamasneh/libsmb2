@@ -328,6 +328,37 @@ smb2_process_ioctl_variable(struct smb2_context *smb2,
                         return -1;
                 }
                 break;
+        case SMB2_FSCTL_SRV_REQUEST_RESUME_KEY:
+                if (rep->output_count < SMB2_SRV_COPYCHUNK_RESUME_KEY_SIZE) {
+                        smb2_set_error(smb2, "Resume key reply too short");
+                        return -1;
+                }
+                ptr = smb2_alloc_init(smb2,
+                                      sizeof(struct smb2_srv_copychunk_resume_key));
+                if (ptr == NULL) {
+                        return -ENOMEM;
+                }
+                memcpy(((struct smb2_srv_copychunk_resume_key *)ptr)->resume_key,
+                       vec.buf, SMB2_SRV_COPYCHUNK_RESUME_KEY_SIZE);
+                break;
+        case SMB2_FSCTL_SRV_COPYCHUNK:
+        case SMB2_FSCTL_SRV_COPYCHUNK_WRITE:
+                if (rep->output_count < 12) {
+                        smb2_set_error(smb2, "Copychunk reply too short");
+                        return -1;
+                }
+                ptr = smb2_alloc_init(smb2,
+                                      sizeof(struct smb2_srv_copychunk_reply));
+                if (ptr == NULL) {
+                        return -ENOMEM;
+                }
+                smb2_get_uint32(&vec, 0,
+                                &((struct smb2_srv_copychunk_reply *)ptr)->chunks_written);
+                smb2_get_uint32(&vec, 4,
+                                &((struct smb2_srv_copychunk_reply *)ptr)->chunk_bytes_written);
+                smb2_get_uint32(&vec, 8,
+                                &((struct smb2_srv_copychunk_reply *)ptr)->total_bytes_written);
+                break;
         default:
                 ptr = smb2_alloc_init(smb2, rep->output_count);
                 if (ptr == NULL) {
@@ -442,4 +473,3 @@ smb2_process_ioctl_request_variable(struct smb2_context *smb2,
         req->input = ptr;
         return 0;
 }
-

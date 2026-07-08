@@ -112,7 +112,7 @@ int main(int argc, char *argv[])
                 goto out_close_src;
         }
 
-        dstfh = smb2_open(smb2, dst_url->path, O_WRONLY | O_CREAT | O_TRUNC);
+        dstfh = smb2_open(smb2, dst_url->path, O_RDWR | O_CREAT | O_TRUNC);
         if (dstfh == NULL) {
                 fprintf(stderr, "Failed to open destination file. %s\n",
                         smb2_get_error(smb2));

@@ -8,11 +8,38 @@
  *
  * Build:
  *   gcc -o smb2_blocking smb2_blocking.c -lsmb2 -lpthread
+ *
+ *
+ *
+ * OR:
+ *
+ *
+ *
+ *   gcc -o smb2_blocking smb2_blocking.c -I./include -L./build/lib -lsmb2 -lpthread -Wl,-rpath,/home/rida/libsmb2/build/lib -Wall -Wextra -g -Wno-unused-variable -Wno-unused-parameter 
+ * 
+ *
+ *
+  To run it:   ./smb2_blocking 127.0.0.1 smbtest test_dir/a test_dir rida $PWD$
+
+usage: ./smb2_blocking <server> <share> <file_path> <watch_dir> [user] [password]
+
+  server     — hostname or IP of the SMB server
+  share      — share name (no leading slashes)
+  file_path  — path to a file inside the share to read
+  watch_dir  — directory inside the share to watch for changes
+  user       — (optional) username
+  password   — (optional) password
+
+example:
+  ./smb2_blocking 127.0.0.1 testshare somefile.txt . guest ""
+
+
  */
 
 #include <pthread.h>
 #include <poll.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +49,7 @@
 #include <smb2/smb2.h>
 #include <smb2/libsmb2.h>
 #include <smb2/libsmb2-raw.h>
+#include "libsmb2-private.h"
 
 /* =========================================================================
  * Configuration
@@ -30,6 +58,14 @@
 #define SMB2_MAX_QUEUE      256     /* max pending commands before backpressure */
 #define SMB2_POLL_TIMEOUT   1000    /* ms — safety net poll timeout             */
 #define SMB2_SERVICE_SLEEP  100     /* us — yield when nothing to poll          */
+
+#if defined(ESP_PLATFORM)
+#define SMB2_BLOCKING_NOTIFY_OUTPUT_BUFFER_LENGTH 512
+#elif defined(__PS2__)
+#define SMB2_BLOCKING_NOTIFY_OUTPUT_BUFFER_LENGTH 4096
+#else
+#define SMB2_BLOCKING_NOTIFY_OUTPUT_BUFFER_LENGTH 0xffff
+#endif
 
 /* =========================================================================
  * smb2_result_t  —  per-command completion state
@@ -57,7 +93,7 @@ static void smb2_result_destroy(smb2_result_t *r) {
 }
 
 /* =========================================================================
- * smb2_pending_t  —  entry in the submit queue
+ * smb2_op_t
  * ========================================================================= */
 
 typedef enum {
@@ -70,7 +106,24 @@ typedef enum {
     SMB2_OP_MKDIR,
     SMB2_OP_UNLINK,
     SMB2_OP_RENAME,
+    SMB2_OP_CHANGE_NOTIFY,
+    SMB2_OP_CHANGE_NOTIFY_CANCEL,
 } smb2_op_t;
+
+/* =========================================================================
+ * Change notify types — forward declared for use in smb2_pending_t
+ * ========================================================================= */
+
+typedef struct smb2_watch smb2_watch_t;
+
+typedef struct smb2_change_notify {
+    uint32_t    action;
+    const char *file_name;
+} smb2_change_notify_t;
+
+/* =========================================================================
+ * smb2_pending_t  —  entry in the submit queue
+ * ========================================================================= */
 
 typedef struct smb2_pending {
     smb2_op_t        op;
@@ -86,7 +139,9 @@ typedef struct smb2_pending {
         struct { const char *path;                                        } mkdir;
         struct { const char *path;                                        } unlink;
         struct { const char *oldpath; const char *newpath;               } rename;
-    } args;
+        struct { smb2_watch_t *watch;                                    } notify;
+        struct { smb2_watch_t *watch;                                    } notify_cancel;
+} args;
 
     struct smb2_pending *next;
 } smb2_pending_t;
@@ -155,8 +210,29 @@ typedef struct {
     pthread_t            thread;
 } smb2_svc_t;
 
-/* forward declarations */
-static smb2_svc_t *g_svc = NULL;
+/* =========================================================================
+ * Change notify — callback type and watch handle
+ * ========================================================================= */
+
+/*
+ * Fired on the service thread when a change arrives.
+ */
+
+typedef int (*smb2_notify_cb_t)(
+        smb2_change_notify_t      *changes,
+        uint32_t                   num_changes,
+        void                      *userdata);
+
+struct smb2_watch {
+    smb2_svc_t        *svc;
+    uint32_t           completion_filter;
+    int                watch_tree;
+    smb2_notify_cb_t   cb;
+    void              *userdata;
+    struct smb2fh     *fh;
+    volatile int       cancelled;
+    pthread_mutex_t    lock;
+};
 
 /* =========================================================================
  * Generic callback — fired by service thread inside smb2_service()
@@ -187,18 +263,180 @@ static void generic_cb(struct smb2_context *smb2,
 }
 
 /* =========================================================================
+ * Change notify callback
+ * ========================================================================= */
+
+typedef struct {
+    smb2_svc_t   *svc;
+    smb2_watch_t *watch;
+} notify_cb_ctx_t;
+
+static uint32_t
+count_notify_changes(const struct smb2_file_notify_change_information *fnc)
+{
+    uint32_t count = 0;
+
+    while (fnc) {
+        count++;
+        fnc = fnc->next;
+    }
+
+    return count;
+}
+
+/* forward declaration */
+static int dispatch_notify(smb2_svc_t *svc, smb2_watch_t *watch);
+
+static void notify_cb(struct smb2_context *smb2,
+                       int status, void *data, void *private_data)
+{
+    notify_cb_ctx_t *ctx   = private_data;
+    smb2_svc_t      *svc   = ctx->svc;
+    smb2_watch_t    *watch = ctx->watch;
+
+    if (smb2->hdr.flags & SMB2_FLAGS_ASYNC_COMMAND) {
+        fprintf(stdout, "[notify] async_id=%" PRIu64 "\n", smb2->hdr.async.async_id);
+    } else {
+        fprintf(stdout, "[notify] async_id=<sync>\n");
+    }
+
+    if (status == SMB2_STATUS_PENDING) {
+        fprintf(stdout, "[notify] STATUS_PENDING\n");
+
+        /* check this call later */
+        /* smb2_set_passthrough(smb2, 0); */
+        return;
+    }
+
+    free(ctx);
+    svc->inflight--;
+
+    pthread_mutex_lock(&watch->lock);
+    int cancelled = watch->cancelled;
+    pthread_mutex_unlock(&watch->lock);
+
+    if (cancelled || status < 0) {
+        if (status < 0 && !cancelled)
+            fprintf(stderr, "[notify] error: %s\n", smb2_get_error(smb2));
+
+        pthread_mutex_lock(&watch->lock);
+        watch->fh = NULL;
+        pthread_mutex_unlock(&watch->lock);
+
+        pthread_mutex_destroy(&watch->lock);
+        free(watch);
+        return;
+    }
+
+    /* parse result and fire user callback */
+    smb2_change_notify_t *changes = NULL;
+    uint32_t              num_changes = 0;
+    struct smb2_file_notify_change_information *fnc = NULL;
+
+    if (status == 0 && data) {
+        struct smb2_change_notify_reply *reply = data;
+        struct smb2_iovec vec;
+        struct smb2_file_notify_change_information *cur;
+        uint32_t i;
+
+        if (reply->output_buffer_length > 0 && reply->output != NULL) {
+            fnc = calloc(1, sizeof(*fnc));
+            if (fnc == NULL) {
+                fprintf(stderr, "[notify] failed to allocate notify decode state\n");
+                status = -ENOMEM;
+            } else {
+                vec.buf = reply->output;
+                vec.len = reply->output_buffer_length;
+                if (smb2_decode_filenotifychangeinformation(smb2, fnc, &vec, 0) != 0) {
+                    fprintf(stderr, "[notify] failed to decode change notify reply: %s\n", smb2_get_error(smb2));
+                    free_smb2_file_notify_change_information(smb2, fnc);
+                    fnc = NULL;
+                    status = -EIO;
+                } else {
+                    num_changes = count_notify_changes(fnc);
+                    changes = calloc(num_changes, sizeof(*changes));
+                    if (changes == NULL) {
+                        fprintf(stderr, "[notify] failed to allocate notify change array\n");
+                        free_smb2_file_notify_change_information(smb2, fnc);
+                        fnc = NULL;
+                        num_changes = 0;
+                        status = -ENOMEM;
+                    } else {
+                        cur = fnc;
+                        for (i = 0; i < num_changes; i++) {
+                            changes[i].action = cur->action;
+                            changes[i].file_name = cur->name;
+                            cur = cur->next;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    watch->cb(changes, num_changes, watch->userdata);
+
+    free(changes);
+    if (fnc) {
+        free_smb2_file_notify_change_information(smb2, fnc);
+    }
+
+    pthread_mutex_lock(&watch->lock);
+    watch->fh = NULL;
+    pthread_mutex_unlock(&watch->lock);
+
+    pthread_mutex_destroy(&watch->lock);
+    free(watch);
+}
+
+static int dispatch_notify(smb2_svc_t *svc, smb2_watch_t *watch) {
+    pthread_mutex_lock(&watch->lock);
+    int            cancelled = watch->cancelled;
+    struct smb2fh *fh        = watch->fh;
+    pthread_mutex_unlock(&watch->lock);
+
+    if (cancelled || !fh) return 0;
+
+    notify_cb_ctx_t *ctx = malloc(sizeof(*ctx));
+    struct smb2_change_notify_request ch_req;
+    struct smb2_pdu *pdu;
+    if (!ctx) return -1;
+    ctx->svc   = svc;
+    ctx->watch = watch;
+
+    memset(&ch_req, 0, sizeof(ch_req));
+    ch_req.flags = watch->watch_tree ? SMB2_CHANGE_NOTIFY_WATCH_TREE : 0;
+    ch_req.output_buffer_length = SMB2_BLOCKING_NOTIFY_OUTPUT_BUFFER_LENGTH;
+    memcpy(ch_req.file_id, smb2_get_file_id(fh), SMB2_FD_SIZE);
+    ch_req.completion_filter = watch->completion_filter;
+
+    pdu = smb2_cmd_change_notify_async(svc->smb2, &ch_req, notify_cb, ctx);
+    if (pdu == NULL) {
+        fprintf(stderr, "[notify] smb2_cmd_change_notify_async failed: %s\n", smb2_get_error(svc->smb2));
+        free(ctx);
+        return -1;
+    }
+    smb2_queue_pdu(svc->smb2, pdu);
+
+    svc->inflight++;
+    return 0;
+}
+
+/* =========================================================================
  * Dispatch — called only from service thread
  * ========================================================================= */
 
 static int dispatch(smb2_svc_t *svc, smb2_pending_t *p) {
-    smb2_cb_ctx_t *ctx = malloc(sizeof(*ctx));
-    if (!ctx) return -1;
-    ctx->svc    = svc;
-    ctx->result = p->result;
-
     int rc = 0;
+
     switch (p->op) {
-        case SMB2_OP_CONNECT:
+
+        case SMB2_OP_CONNECT: {
+            smb2_cb_ctx_t *ctx = malloc(sizeof(*ctx));
+            if (!ctx) return -1;
+            ctx->svc    = svc;
+            ctx->result = p->result;
+
             if (p->args.connect.password)
                 smb2_set_password(svc->smb2, p->args.connect.password);
             if (p->args.connect.user)
@@ -211,66 +449,178 @@ static int dispatch(smb2_svc_t *svc, smb2_pending_t *p) {
                      p->args.connect.share,
                      p->args.connect.user,
                      generic_cb, ctx);
+            if (rc < 0) { free(ctx); return -1; }
+            svc->inflight++;
             break;
-        case SMB2_OP_OPEN:
+        }
+
+        case SMB2_OP_OPEN: {
+            smb2_cb_ctx_t *ctx = malloc(sizeof(*ctx));
+            if (!ctx) return -1;
+            ctx->svc    = svc;
+            ctx->result = p->result;
             rc = smb2_open_async(svc->smb2,
                      p->args.open.path,
                      p->args.open.flags,
                      generic_cb, ctx);
+            if (rc < 0) { free(ctx); return -1; }
+            svc->inflight++;
             break;
-        case SMB2_OP_CLOSE:
+        }
+
+        case SMB2_OP_CLOSE: {
+            smb2_cb_ctx_t *ctx = malloc(sizeof(*ctx));
+            if (!ctx) return -1;
+            ctx->svc    = svc;
+            ctx->result = p->result;
             rc = smb2_close_async(svc->smb2,
                      p->args.close.fh,
                      generic_cb, ctx);
+            if (rc < 0) { free(ctx); return -1; }
+            svc->inflight++;
             break;
-        case SMB2_OP_READ:
+        }
+
+        case SMB2_OP_READ: {
+            smb2_cb_ctx_t *ctx = malloc(sizeof(*ctx));
+            if (!ctx) return -1;
+            ctx->svc    = svc;
+            ctx->result = p->result;
             rc = smb2_read_async(svc->smb2,
                      p->args.read.fh,
                      p->args.read.buf,
                      p->args.read.len,
                      generic_cb, ctx);
+            if (rc < 0) { free(ctx); return -1; }
+            svc->inflight++;
             break;
-        case SMB2_OP_WRITE:
+        }
+
+        case SMB2_OP_WRITE: {
+            smb2_cb_ctx_t *ctx = malloc(sizeof(*ctx));
+            if (!ctx) return -1;
+            ctx->svc    = svc;
+            ctx->result = p->result;
             rc = smb2_write_async(svc->smb2,
                      p->args.write.fh,
                      p->args.write.buf,
                      p->args.write.len,
                      generic_cb, ctx);
+            if (rc < 0) { free(ctx); return -1; }
+            svc->inflight++;
             break;
-        case SMB2_OP_STAT:
+        }
+
+        case SMB2_OP_STAT: {
+            smb2_cb_ctx_t *ctx = malloc(sizeof(*ctx));
+            if (!ctx) return -1;
+            ctx->svc    = svc;
+            ctx->result = p->result;
             rc = smb2_stat_async(svc->smb2,
                      p->args.stat.path,
-                     p->args.stat.st,      /* caller-allocated, filled in-place */
+                     p->args.stat.st,
                      generic_cb, ctx);
+            if (rc < 0) { free(ctx); return -1; }
+            svc->inflight++;
             break;
-        case SMB2_OP_MKDIR:
+        }
+
+        case SMB2_OP_MKDIR: {
+            smb2_cb_ctx_t *ctx = malloc(sizeof(*ctx));
+            if (!ctx) return -1;
+            ctx->svc    = svc;
+            ctx->result = p->result;
             rc = smb2_mkdir_async(svc->smb2,
                      p->args.mkdir.path,
                      generic_cb, ctx);
+            if (rc < 0) { free(ctx); return -1; }
+            svc->inflight++;
             break;
-        case SMB2_OP_UNLINK:
+        }
+
+        case SMB2_OP_UNLINK: {
+            smb2_cb_ctx_t *ctx = malloc(sizeof(*ctx));
+            if (!ctx) return -1;
+            ctx->svc    = svc;
+            ctx->result = p->result;
             rc = smb2_unlink_async(svc->smb2,
                      p->args.unlink.path,
                      generic_cb, ctx);
+            if (rc < 0) { free(ctx); return -1; }
+            svc->inflight++;
             break;
-        case SMB2_OP_RENAME:
+        }
+
+        case SMB2_OP_RENAME: {
+            smb2_cb_ctx_t *ctx = malloc(sizeof(*ctx));
+            if (!ctx) return -1;
+            ctx->svc    = svc;
+            ctx->result = p->result;
             rc = smb2_rename_async(svc->smb2,
                      p->args.rename.oldpath,
                      p->args.rename.newpath,
                      generic_cb, ctx);
+            if (rc < 0) { free(ctx); return -1; }
+            svc->inflight++;
             break;
+        }
+
+        case SMB2_OP_CHANGE_NOTIFY: {
+            smb2_watch_t *watch = p->args.notify.watch;
+
+            pthread_mutex_lock(&watch->lock);
+            struct smb2fh *fh = watch->fh;
+            pthread_mutex_unlock(&watch->lock);
+
+            if (!fh) {
+                fprintf(stderr, "[notify] missing watch directory handle\n");
+                pthread_mutex_lock(&p->result->lock);
+                p->result->status = -1;
+                p->result->done   = 1;
+                pthread_cond_signal(&p->result->cond);
+                pthread_mutex_unlock(&p->result->lock);
+                return -1;
+            }
+            /* signal caller: registration succeeded */
+            pthread_mutex_lock(&p->result->lock);
+            p->result->status = 0;
+            p->result->data   = watch;
+            p->result->done   = 1;
+            pthread_cond_signal(&p->result->cond);
+            pthread_mutex_unlock(&p->result->lock);
+
+            /* arm the first async change notify */
+            dispatch_notify(svc, watch);
+            rc = 0;
+            break;
+        }
+
+        case SMB2_OP_CHANGE_NOTIFY_CANCEL: {
+            smb2_watch_t *watch = p->args.notify_cancel.watch;
+
+            pthread_mutex_lock(&watch->lock);
+            watch->cancelled = 1;
+            pthread_mutex_unlock(&watch->lock);
+
+            /*
+             * Actual cleanup (free) happens in notify_cb when the server
+             * responds to the now-cancelled request.
+             */
+            pthread_mutex_lock(&p->result->lock);
+            p->result->status = 0;
+            p->result->done   = 1;
+            pthread_cond_signal(&p->result->cond);
+            pthread_mutex_unlock(&p->result->lock);
+            rc = 0;
+            break;
+        }
+
         default:
             rc = -1;
             break;
     }
 
-    if (rc < 0) {
-        free(ctx);
-        return -1;
-    }
-
-    svc->inflight++;
-    return 0;
+    return rc;
 }
 
 /* =========================================================================
@@ -291,12 +641,16 @@ static void *service_thread(void *arg) {
         smb2_pending_t *p;
         while ((p = queue_try_pop(&svc->queue)) != NULL) {
             if (dispatch(svc, p) < 0) {
-                /* dispatch failed — complete with error immediately */
-                pthread_mutex_lock(&p->result->lock);
-                p->result->status = -1;
-                p->result->done   = 1;
-                pthread_cond_signal(&p->result->cond);
-                pthread_mutex_unlock(&p->result->lock);
+                /* dispatch failed and did not signal result — signal error now
+                 * (CHANGE_NOTIFY and CHANGE_NOTIFY_CANCEL signal inside dispatch) */
+                if (p->op != SMB2_OP_CHANGE_NOTIFY &&
+                    p->op != SMB2_OP_CHANGE_NOTIFY_CANCEL) {
+                    pthread_mutex_lock(&p->result->lock);
+                    p->result->status = -1;
+                    p->result->done   = 1;
+                    pthread_cond_signal(&p->result->cond);
+                    pthread_mutex_unlock(&p->result->lock);
+                }
             }
             free(p);
         }
@@ -592,11 +946,82 @@ int smb2_blocking_rename(smb2_svc_t *svc,
 }
 
 /* =========================================================================
- * Demo — multiple producer threads issuing concurrent reads
+ * Public API — change notify
  * ========================================================================= */
 
-#define NUM_PRODUCERS   400
-#define READS_PER_PROD  80
+/*
+ * smb2_blocking_watch()
+ *
+ * Registers a change notify watch on a directory.
+ * Returns an opaque smb2_watch_t* handle on success, NULL on failure.
+ *
+ * completion_filter:  SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_FILE_NAME  |
+ *                     SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_DIR_NAME   |
+ *                     SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_LAST_WRITE | ... (see smb2.h)
+ * watch_tree:         1 = recursive, 0 = top-level directory only
+ *
+ * The callback fires on the SERVICE THREAD — keep it short and
+ * non-blocking. Do not call smb2_blocking_* from inside the callback.
+ *
+ */
+smb2_watch_t *smb2_blocking_watch(smb2_svc_t       *svc,
+                                   struct smb2fh    *dir_handle,
+                                   uint32_t          completion_filter,
+                                   int               watch_tree,
+                                   smb2_notify_cb_t  cb,
+                                   void             *userdata)
+{
+    smb2_watch_t *watch = calloc(1, sizeof(*watch));
+    if (!watch) return NULL;
+
+    watch->svc               = svc;
+    watch->completion_filter = completion_filter;
+    watch->watch_tree        = watch_tree;
+    watch->cb                = cb;
+    watch->userdata          = userdata;
+    watch->cancelled         = 0;
+    watch->fh                = dir_handle;
+    pthread_mutex_init(&watch->lock, NULL);
+
+    smb2_pending_t *p = calloc(1, sizeof(*p));
+    smb2_result_t   res;
+
+    p->op                = SMB2_OP_CHANGE_NOTIFY;
+    p->args.notify.watch = watch;
+
+    int rc = submit_and_wait(svc, p, &res);
+    if (rc < 0) {
+        pthread_mutex_destroy(&watch->lock);
+        free(watch);
+        return NULL;
+    }
+
+    return watch;
+}
+
+/*
+ * smb2_blocking_unwatch()
+ *
+ * Cancels an active watch. The watch handle is freed asynchronously
+ * once the server responds to the cancelled request.
+ * Do NOT use the watch handle after calling this.
+ */
+int smb2_blocking_unwatch(smb2_svc_t *svc, smb2_watch_t *watch) {
+    smb2_pending_t *p = calloc(1, sizeof(*p));
+    smb2_result_t   res;
+
+    p->op                         = SMB2_OP_CHANGE_NOTIFY_CANCEL;
+    p->args.notify_cancel.watch   = watch;
+
+    return submit_and_wait(svc, p, &res);
+}
+
+/* =========================================================================
+ * Demo — producer threads + change notify watcher
+ * ========================================================================= */
+
+#define NUM_PRODUCERS   111
+#define READS_PER_PROD  111
 #define READ_BUF_SIZE   65536
 
 typedef struct {
@@ -608,9 +1033,10 @@ typedef struct {
 static void *producer_thread(void *arg) {
     producer_args_t *a   = arg;
     smb2_svc_t      *svc = a->svc;
+    unsigned int     seed = (unsigned int)(time(NULL) ^ (a->id * 1103515245u));
 
     struct smb2fh *fh = NULL;
-    int rc = smb2_blocking_open(svc, a->path, O_RDONLY, &fh);
+    int rc = smb2_blocking_open(svc, a->path, O_RDWR, &fh);
     if (rc < 0 || !fh) {
         fprintf(stderr, "[prod %d] open failed: %d\n", a->id, rc);
         return NULL;
@@ -618,15 +1044,23 @@ static void *producer_thread(void *arg) {
     fprintf(stderr, "[prod %d] opened %s\n", a->id, a->path);
 
     uint8_t *buf = malloc(READ_BUF_SIZE);
+    if (buf == NULL) {
+        fprintf(stderr, "[prod %d] buffer allocation failed\n", a->id);
+        smb2_blocking_close(svc, fh);
+        return NULL;
+    }
 
     for (int i = 0; i < READS_PER_PROD; i++) {
-        int n = smb2_blocking_read(svc, fh, buf, READ_BUF_SIZE);
+        for (uint32_t j = 0; j < READ_BUF_SIZE; j++) {
+            buf[j] = (uint8_t)(rand_r(&seed) & 0xff);
+        }
+
+        int n = smb2_blocking_write(svc, fh, buf, READ_BUF_SIZE);
         if (n < 0) {
-            fprintf(stderr, "[prod %d] read %d failed: %d\n", a->id, i, n);
+            fprintf(stderr, "[prod %d] write %d failed: %d\n", a->id, i, n);
             break;
         }
-        fprintf(stderr, "[prod %d] read %d: got %d bytes\n", a->id, i, n);
-        if (n == 0) break;   /* EOF */
+        fprintf(stderr, "[prod %d] write %d: wrote %d bytes\n", a->id, i, n);
     }
 
     free(buf);
@@ -635,18 +1069,60 @@ static void *producer_thread(void *arg) {
     return NULL;
 }
 
+/* Change notify callback — fired on service thread */
+static int on_change(smb2_change_notify_t      *changes,
+                     uint32_t                   num_changes,
+                     void                      *userdata)
+{
+    (void)userdata;
+
+    if (num_changes == 0) {
+        fprintf(stderr, "[notify] buffer overflow — too many changes\n");
+        return 0;
+    }
+
+        fprintf(stderr, "[notify] %u change(s):\n", num_changes);
+        for (uint32_t i = 0; i < num_changes; i++) {
+            const char *action_str = "UNKNOWN";
+            switch (changes[i].action) {
+            case SMB2_NOTIFY_CHANGE_FILE_ACTION_ADDED:            action_str = "ADDED";             break;
+            case SMB2_NOTIFY_CHANGE_FILE_ACTION_REMOVED:          action_str = "REMOVED";           break;
+            case SMB2_NOTIFY_CHANGE_FILE_ACTION_MODIFIED:         action_str = "MODIFIED";          break;
+            case SMB2_NOTIFY_CHANGE_FILE_ACTION_RENAMED_OLD_NAME: action_str = "RENAMED_OLD_NAME";  break;
+            case SMB2_NOTIFY_CHANGE_FILE_ACTION_RENAMED_NEW_NAME: action_str = "RENAMED_NEW_NAME";  break;
+            }
+        fprintf(stderr, "  [%u] action=%-20s  name=%s\n",
+                i, action_str,
+                changes[i].file_name ? changes[i].file_name : "(null)");
+    }
+
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
-    if (argc < 4) {
-        fprintf(stderr, "usage: %s <server> <share> <path> [user] [password]\n",
-                argv[0]);
+    if (argc < 5) {
+        fprintf(stderr,
+            "usage: %s <server> <share> <file_path> <watch_dir> [user] [password]\n"
+            "\n"
+            "  server     — hostname or IP of the SMB server\n"
+            "  share      — share name (no leading slashes)\n"
+            "  file_path  — path to a file inside the share to read\n"
+            "  watch_dir  — directory inside the share to watch for changes\n"
+            "  user       — (optional) username\n"
+            "  password   — (optional) password\n"
+            "\n"
+            "example:\n"
+            "  %s 127.0.0.1 testshare somefile.txt . guest \"\"\n",
+            argv[0], argv[0]);
         return 1;
     }
 
-    const char *server   = argv[1];
-    const char *share    = argv[2];
-    const char *path     = argv[3];
-    const char *user     = (argc >= 5) ? argv[4] : NULL;
-    const char *password = (argc >= 6) ? argv[5] : NULL;
+    const char *server    = argv[1];
+    const char *share     = argv[2];
+    const char *file_path = argv[3];
+    const char *watch_dir = argv[4];
+    const char *user      = (argc >= 6) ? argv[5] : NULL;
+    const char *password  = (argc >= 7) ? argv[6] : NULL;
 
     /* init service context + start service thread */
     smb2_svc_t *svc = smb2_svc_init();
@@ -661,20 +1137,58 @@ int main(int argc, char *argv[]) {
     }
     fprintf(stderr, "connected to \\\\%s\\%s\n", server, share);
 
-    /* launch producer threads — all share the same svc / TCP connection */
-    pthread_t        threads[NUM_PRODUCERS];
-    producer_args_t  args[NUM_PRODUCERS];
+    /* register change notify on watch_dir before producers start */
+    uint32_t filter = SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_FILE_NAME  |
+                      SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_DIR_NAME   |
+                      SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_LAST_WRITE |
+                      SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_LAST_ACCESS |
+                      SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_ATTRIBUTES |
+                      SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_SIZE;
+    struct smb2fh *watch_fh = NULL;
+
+#ifdef O_DIRECTORY
+    rc = smb2_blocking_open(svc, watch_dir, O_DIRECTORY, &watch_fh);
+#else
+    rc = smb2_blocking_open(svc, watch_dir, 0, &watch_fh);
+#endif
+    if (rc < 0 || !watch_fh) {
+        fprintf(stderr, "[main] failed to open watch directory '%s': %d\n",
+                watch_dir, rc);
+        smb2_svc_shutdown(svc);
+        return 1;
+    }
+
+    /* check later */
+    smb2_set_passthrough(svc->smb2, 0);
+
+    smb2_watch_t *watch = smb2_blocking_watch(svc, watch_fh, filter, /*watch_tree=*/0, on_change, NULL);
+
+    if (!watch)
+        fprintf(stderr, "[main] change notify registration failed — continuing without watch\n");
+    else
+        fprintf(stderr, "[main] watching '%s' for changes\n", watch_dir);
+
+    /* launch producer threads */
+    pthread_t       threads[NUM_PRODUCERS];
+    producer_args_t args[NUM_PRODUCERS];
 
     for (int i = 0; i < NUM_PRODUCERS; i++) {
         args[i].svc  = svc;
         args[i].id   = i;
-        args[i].path = path;
+        args[i].path = file_path;
         pthread_create(&threads[i], NULL, producer_thread, &args[i]);
     }
 
     for (int i = 0; i < NUM_PRODUCERS; i++)
         pthread_join(threads[i], NULL);
 
+    fprintf(stderr, "[main] all producers done — press Enter to stop watching\n");
+    getchar();
+
+    if (watch_fh)
+        smb2_blocking_close(svc, watch_fh);
+
+    sleep(1);   /* let cancel propagate before tearing down */
     smb2_svc_shutdown(svc);
     fprintf(stderr, "shutdown complete\n");
     return 0;
